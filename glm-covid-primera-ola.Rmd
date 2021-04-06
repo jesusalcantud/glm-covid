@@ -1,0 +1,401 @@
+---
+title: "Modelos Lineales Generalizados (GLM)"
+subtitle: 'Predicción de incidencia acumulada de COVID-19 en España durante la primera ola mediante GLM.'
+author: "Jesús Alcantud"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'glm_covid.html'))})
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(TTR)
+library(caret)
+library(GGally)
+library(zoo)
+library(reshape2)
+library(effects)
+```
+
+## Introducción
+
+Para este ejercicio, vamos a desarrollar un modelo GLM cuyo objetivo sea predecir la **incidendia acumulada** de 14 días (IA14) de la **primera la ola** de COVID-19 en España, ya que, por aquel entonces, no se contaba con los medios necesarios para poder testear a la población y tener una idea más o menos fiable de los casos reales.
+
+Por cuestiones mencionadas en el siguiente apartado, lo que vamos a predecir realmente va a ser los *casos totales acumulados en 14 días* y, a la hora de predecir los datos, calcularemos a mano dicha tasa.
+
+El motivo de elegir la IA14 en vez de casos diarios es que, en base a los datos que he podido recopilar, las variables más explicativas están relacionadas con las defunciones y las hospitalizaciones, las cuales no ocurren en el momento de detectar un nuevo caso, sino días, e incluso semanas, después.
+
+## Preparación de datos
+
+Aunque pueda sorprender, no ha sido posible encontrar sets de datos de la IA14 durante la primera la ola. En el [portal del ISCIII](https://cnecovid.isciii.es/covid19/#documentaci%C3%B3n-y-datos), obtienen dichos datos a través de SiViES (Sistema de Vigilancia de España, pero no nos los facilitan ni tampoco es posible acceder a dicho portal para obtenerlos por nuestra cuenta.
+
+Otro problema con el que me he encontrado es que en algunas bases de datos, tanto las variables que hacían referencia a nuevos casos, como las de casos acumulado, tenían algunos valores negativos, lo cual no tiene sentido y además nos impediría utilizar modelos GLM como el de Poisson, por lo que he tenido que utilizar varias fuentes de datos y hacer algunos cálculos manuales que mostraré a continuación.
+
+### Selección de fuentes de datos {.tabset}
+
+#### Fuente 1
+Fuente: [Escovid19data](https://lab.montera34.com/covid19/). Es el set de datos que cuenta con los problemas previamente mencionados. Sin emargo, tiene otras variables que nos serán de gran utilidad, y que están exentas de dichos errores, relacionadas con hospitalización, ingresos en UCI, etc.
+
+Los datos están agregados a nivel nacional.
+
+```{r}
+cons_esp <- read.csv('data/covid19-spain_consolidated.csv') #EscovidDatos
+
+cons_esp$date <- ymd(cons_esp$date)
+
+cons_esp <- cons_esp[, c('date','new_cases', 'hospitalized', 'hospitalized_new', 'intensive_care')]
+
+cons_esp <- cons_esp %>% filter(date >= '2020-02-24' & date <= '2021-02-28')
+```
+
+#### Fuente 2
+
+Fuente: [ISCIII](https://cnecovid.isciii.es/covid19/#documentaci%C3%B3n-y-datos). Esta fuente nos ofrece, entre otros datos, los casos de COVID-19 registrados desagregados por provincias o por CCAA, como es el caso del dataset que he escogido.
+
+Agregamos los valores a nivel nacional y realizamos el cálculo previamente mencionado.
+
+```{r}
+casos_isciii <- read.csv('data/casos_tecnica_ccaa.csv')
+
+unique(casos_isciii$ccaa_iso)
+casos_isciii$fecha <- ymd(casos_isciii$fecha)
+
+casos_isciii <- aggregate(x = casos_isciii[, 3:ncol(casos_isciii)],
+                          FUN = sum,
+                          by = list(date = casos_isciii$fecha))
+
+casos_isciii <- casos_isciii %>% mutate(acum14_calc = rollsum(x = num_casos, 14, align = "right", fill = NA))
+
+casos_isciii <- casos_isciii %>% filter(date >= '2020-02-24' & date <= '2021-02-28')
+```
+
+
+#### Fuente 3
+
+Fuente: [MoMo ISCIII](https://momo.isciii.es/public/momo/dashboard/momo_dashboard.html#datos). Este dataset proviene de un portal del ISCIII en el que obtenemos datos, también a nivel nacional, relacionados con los fallecimientos. Incluye variables cuyos valores son predicciones de la muerte esperada para un día en concreto, además de los fallecimientos observados. Podremos calcular el exceso de muerte, variable que podría ser candidata de nuestro modelo.
+
+Filtramos de nuevo las variables que nos interesan y hacemos un *merge* con el resto de nuestros datos.
+
+```{r}
+muertes_isciii <- read.csv('data/muertes_isciii.csv') #ISCIII MoMo
+
+muertes_isciii <- muertes_isciii %>% filter(ambito == 'nacional' & cod_sexo == 'all' & nombre_sexo == 'todos' & cod_gedad == 'all' & nombre_gedad == 'todos')
+
+muertes_isciii <- muertes_isciii[, 9:ncol(muertes_isciii)]
+
+muertes_isciii$fecha_defuncion <- ymd(muertes_isciii$fecha_defuncion)
+muertes_isciii <- muertes_isciii %>% mutate(dif_muertes = defunciones_observadas - defunciones_esperadas)
+
+muertes_isciii <- muertes_isciii %>% filter(fecha_defuncion >= '2020-02-24' & fecha_defuncion <= '2021-02-28')
+
+muertes_isciii$date <- muertes_isciii$fecha_defuncion
+muertes_isciii$fecha_defuncion <- NULL
+
+datos.covid <- merge(muertes_isciii, casos_isciii, by = 'date')
+
+datos.covid <- merge(datos.covid, cons_esp, by = 'date')
+```
+
+### Suavización
+
+Una vez tenemos nuestra tabla elaborada, realizamos una suavización de los datos, con una media móvil simple, para contener los picos, ya que, entre otras casuísticas, durante los fines de semana no se contabilizan nuevos casos.
+
+```{r}
+sm_datos.covid <- cbind(datos.covid$date,
+                        as.data.frame(sapply(datos.covid[, 2:ncol(datos.covid)], function (x) round(SMA(x, n = 7),0))))
+
+sm_datos.covid <- sm_datos.covid %>% drop_na()
+
+sm_datos.covid$date <- sm_datos.covid$`datos.covid$date`
+sm_datos.covid$`datos.covid$date`<- NULL
+```
+
+### Selección de variables y división del dataset
+
+Por último, observamos que muchas de las variables que tenemos son reduntates. Seleccionamos las que más nos interesan y dividimos el dataset en dos:
+* Primera ola: Del 1/3/2020 al 30/6/2020. Es en el que intentaremos predecir nuestra variable.
+* Data: Del 1/7/2020 al 28/2/2021. Es el que utilizaremos para desarrollar nuestro modelo.
+
+```{r}
+names(sm_datos.covid)
+```
+```{r}
+sm_datos.covid <- sm_datos.covid[, c("date","acum14_calc","num_casos","defunciones_observadas","dif_muertes","hospitalized", "hospitalized_new","intensive_care")]
+
+primera.ola <- sm_datos.covid %>% filter(date >= '2020-03-01' & date <= '2020-06-30')
+data <- sm_datos.covid %>% filter(date >= '2020-07-01'& date <= '2021-02-28')
+```
+
+## Desarrollo e interpretación de modelos
+
+### Descriptivo
+
+Antes de empezar a desarrollar nuestro modelo, vamos a realizar un descriptivo sobre nuestro conjunto de datos total y sobre nuestro training set.
+
+#### Descriptivo sobre todos los datos
+
+```{r}
+summary(sm_datos.covid)
+```
+
+Observamos que la variable que hemos creado sobre el exceso de mortalidad tiene valores negativos, ya que en algunos días hubo menos casos de fallecidos de los esperados. Esto puede deberse a días donde la incidencia del virus fuese baja pero hubiese activas medidas de restricción que redujeran la mortalidad por otros factores como los accidentes de tráfico, tal y como se explica con [noticias como esta](https://www.lavanguardia.com/motor/actualidad/20210107/6172240/balance-fallecidos-accidente-trafico-espana-2020-minimo-historico.html).
+
+Eliminamos esta variable de nuestros sets de datos, ya que para un modelo Poisson necesitamos conteos positivos.
+
+```{r}
+
+sm_datos.covid$dif_muertes <- NULL
+data$dif_muertes <- NULL
+primera.ola$dif_muertes <- NULL
+
+```
+
+Dibujamos los boxplots en busca de valores atípicos y para revisar la distribución de los datos.
+
+```{r}
+g <- ggplot(melt(sm_datos.covid[,2:ncol(sm_datos.covid)]), aes(factor(variable), value))
+g + geom_boxplot() + facet_wrap(~variable, scale="free")
+```
+
+Podemos ver que todas las variables siguen más o menos una distribución de Poisson. Sobre los valores atípicos que nos encontramos, no podemos confirmar que se traten de errores, por lo que no modificamos más, de momento, nuestros datos.
+
+#### Descriptivo sobre el training set
+
+Una vez analizados los datos en su conjunto, procedemos a calcular la matriz de correlación entre nuestras variables para nuestro conjunto de entrenamiento de cara a la selección de variables de nuestro modelo.
+
+```{r}
+ggcorr(data, label = T, size = 3)
+```
+
+Vemos que hay una correlación muy alta entre nuestras variables, lo cual tiene sentido. En cuanto a nuestra variable respuesta, *acum14_calc*, observamos que guarda correlaciones muy altas con el resto de variables. Aunque en GLM, relajamos muchas de las hipótesis y podríamos hacer un modelo con variables que tengan cierta correlación, eliminamos la variable *intensive_care*, ya que la correlación que tiene con *hospitalized* es prácticamente perfecta.
+
+También nos deshacemos de *num_casos*, ya que precisamente el objeto de este estudio es predecir una variable cuyo cálculo depende de esta y recordamos que durante la primera ola, el registro de casos diarios fue poco fiable.
+
+```{r}
+data$intensive_care <- NULL
+data$num_casos <- NULL
+ggcorr(data, label = T, size = 3)
+```
+
+#### Desarrollo de modelos {.tabset}
+
+En este apartado vamos crear varios modelos GLM, probando con distintas distribuciones y transformaciones de variables para quedarnos los dos mejores y validar cuál tiene mejor capacidad predictiva. Para ello, volvemos a dividir nuestro set en training y test.
+
+```{r}
+set.seed(42)
+
+idx = createDataPartition(data$acum14_calc, p = 0.8, list = FALSE)
+
+glm_train = data[idx,]
+glm_test = data[-idx,]
+```
+
+##### Modelo 1
+
+Puesto que estamos calculando una variable que hace referencia a un conteo, nuestra primera prueba va a ser utilizando todas las variable (a excepción de *date*) con **GLM Poisson**.
+
+```{r}
+glm_model1 <- glm(acum14_calc ~ . -date, family= "poisson", data = glm_train)
+summary(glm_model1)
+```
+
+Lo que más llama la atención de nuestros datos es la gran sobre dispersión que tienen, por lo que en el siguiente modelo vamos a probar con la familia **quasipoisson**. Lo confirmamos echando un vistazo a la media y a la varianza de nuestra variable respuesta.
+
+```{r}
+mean(glm_train$acum14_calc)
+var(glm_train$acum14_calc)
+```
+
+##### Modelo 2
+
+```{r}
+glm_model2 <- glm(acum14_calc ~ . -date, family= "quasipoisson", data = glm_train)
+summary(glm_model2)
+```
+
+En este caso, perdemos la información sobre el indicador **AIC**, el cuál nos ayuda a evaluar cómo de bien se ajusta nuestro modelo a los datos. Por lo tanto, nuestro tercer modelo será utilizando la familia **binomial negativa**, con la cual también podemos calcular un modelo donde los datos estén sobredispersados. 
+
+##### Modelo 3
+
+```{r}
+library(MASS)
+
+glm_model3 <- glm.nb(acum14_calc ~ hospitalized + defunciones_observadas + hospitalized_new, data = glm_train)
+summary(glm_model3)
+```
+
+Con este modelo, aunque recuperamos el AIC, dos de nuestras variables pasan a no ser significativas. En el siguiente modelo aplicaremos transformaciones para conseguir mejores resultados.
+
+##### Modelo 4
+
+Tras varias pruebas con diferentes transformaciones e interacciones, llegamos al siguiente modelo:
+
+```{r message=FALSE, warning=FALSE}
+library(MASS)
+
+glm_model4 <- glm.nb(acum14_calc ~ log(hospitalized) + log(defunciones_observadas) + hospitalized_new:hospitalized, data = glm_train)
+summary(glm_model4)
+```
+
+Todos nuestros predictores son significativos (tienen *p-value* inferior a 0.05) y ademas hemos reducido el valor del indicador AIC.
+
+##### Modelo 5
+
+Por último, probamos a realizar un GLM de familia gaussiana, es decir, una regresión lineal.
+
+```{r}
+glm_model5 <- glm(acum14_calc ~ log(hospitalized) + log(defunciones_observadas) + hospitalized_new:hospitalized, family = 'gaussian', data = glm_train)
+summary(glm_model5)
+```
+
+Podemos observar que, en términos de significancia de nuestros predictores, y del valor de AIC, obtenemos resultados muy parecidos al anterior modelo.
+
+Sin embargo, comprobamos que no cumplimos las hipótesis de regresión lineal:
+
+```{r}
+par(mfrow=c(2,2))
+plot(glm_model5)
+```
+
+#### Selección de modelo
+
+En base a los resultados obtenidos en el apartado anterior, podemos intuir que nuestro mejor modelo es el GLM negativo binomial con transformaciones. 
+
+Para asegurarnos de que además es el que mejor predice, vamos a comparar dicho modelo (*glm_model4*) con el segundo mejor modelo, es decir, la regresión lineal (*glm_model5*).
+
+```{r}
+pred.bn = predict(glm_model4, newdata=glm_test, type = "response")
+rmse.bn = sqrt(mean((pred.bn-glm_test$acum14_calc)^2))
+
+pred.lm = predict(glm_model5, newdata=glm_test, type = "response")
+rmse.lm = sqrt(mean((pred.lm-glm_test$acum14_calc)^2))
+
+rmse.bn
+rmse.lm
+```
+El error cuadrático medio es prácticamente idéntico con ambos modelos, si bien es cierto que el de la regresión lineal es ligeramente inferior. 
+
+En cualquier caso, en base a lo observado en el apartado anterior, y puesto que el objeto de este ejercicio es trabajar con GLM distintos a LM, nos quedamos con el *glm_model4* como nuestro modelo final.
+
+```{r}
+glm_model_f <- glm_model4
+```
+
+Prescindimos del paquete MASS, ya que nos enmascara la función *select* de dplyr.
+
+```{r message=FALSE, warning=FALSE}
+detach("package:MASS", unload = TRUE)
+```
+
+#### Interpretación
+
+Para interpretar nuestros betas, creamos la siguiente tabla:
+
+```{r message=FALSE}
+exp(cbind(coef(glm_model_f), confint(glm_model_f)))
+```
+
+Según nuestro predictor *log(hospitalized)*, por cuando el número de hospitalizados aumenta un 1%, el número de casos acumulados en 14 días, aumenta, aproximadamente, un 2.77%.
+
+En el siguiente gráfico podemos observar dicha relación:
+
+```{r}
+plot(effect("log(hospitalized)", glm_model_f), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="log(hospitalized)", ylab="Casos acumulados en 14 días", rug=FALSE, main="")
+
+```
+
+Según nuestro predictor *log(defunciones_observadas)*, por cuando el número de defunciones observadas aumenta un 1%, el número de casos acumulados en 14 días, aumenta, aproximadamente, un 2.91%.
+
+En el siguiente gráfico podemos observar dicha relación:
+
+```{r}
+plot(effect("log(defunciones_observadas)", glm_model_f), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="log(defunciones_observadas)", ylab="Casos acumulados en 14 días", rug=FALSE, main="")
+```
+
+El valor exponencial de nuestro predictor *hospitalized_new:hospitalized* es muy cercano a 1, lo cual nos indica que no es demasiado significativo.
+
+En el siguiente gráfico podemos observar que el aumento de nuevos hospitalizados sólo es significativo cuando la ocupación en los hospitales es muy alta y además la relación es negativa.
+
+Esto nos podría indicar que, cuando los hospitales están muy llenos, estamos en el pico de una ola, por lo que la incidencia acumulada en 14 días tenderá a descender conforme se vayan registrando nuevos ingresos.
+
+```{r}
+plot(effect("hospitalized_new:hospitalized", glm_model_f), ci.style="band", rescale.axis=FALSE, multiline=TRUE, xlab="hospitalized_new:hospitalized", ylab="Casos acumulados en 14 días", rug=FALSE, main="")
+```
+
+## Predicción y conclusiones
+
+### Predicción
+
+En este apartado, vamos a calcular las predicciones del dataset completo que incluye tanto los casos a partir del 1 de julio de 2020 (los que hemos utilizado para desarrollar el modelo), como los de la primera ola, que son los que pretendemos estimar. 
+
+Tal y como se comentaba en la introducción del ejercicio, vamos a transformar nuestro a output de casos acumulados a incidencia acumulada en 14 días cada 100.000 habitantes. Para hacerlo correctamente, habría que tener en cuenta, no solo la población total de España, sino el número de contagiados al inicio del periodo, pero, puesto que la diferencia entre población total y población contagiar es mínima, en términos relativos, utilizaremos solo la población total.
+
+Calculamos las predicciones, la transformación a IA14 y lo guardamos en un dataframe.
+
+```{r}
+preds = predict(glm_model_f, newdata=sm_datos.covid, type = "link", se.fit=T)
+critval <- 1.96 
+upr <- preds$fit + (critval * preds$se.fit)
+lwr <- preds$fit - (critval * preds$se.fit)
+fit <- preds$fit
+
+fit2 <- glm_model_f$family$linkinv(fit)
+upr2 <- glm_model_f$family$linkinv(upr)
+lwr2 <- glm_model_f$family$linkinv(lwr)
+
+pred <- predict(glm_model_f, newdata=sm_datos.covid, type = "response")
+
+g <- data.frame(date = sm_datos.covid$date,
+                ia14EST = round((pred/47329981)*100000, 0), 
+                ia14_CALC = round((sm_datos.covid$acum14_calc/47329981)*100000, 0),
+                upr = round((upr2/47329981)*100000, 0),
+                lwr = round((lwr2/47329981)*100000, 0))
+```
+
+Generamos nuestro gráfico.
+
+```{r}
+colors <- c("IA14 estimada" = "brown1", "IA14 registrada" = "deepskyblue")
+
+ggplot(g, aes(x=date)) + 
+      geom_line(aes(y = ia14EST, color = 'IA14 estimada')) +
+      geom_line(aes(y = ia14_CALC, color = 'IA14 registrada')) +
+      geom_ribbon(aes(ymin=lwr,ymax=upr, fill = 'IA14 estimada IC 95%'), color = NA,alpha=0.3) +
+  theme(axis.line = element_line(colour = "grey"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()) +
+    geom_vline(xintercept = as.numeric(ymd("2020-07-01")), linetype="dashed", color = 'grey3') +
+  geom_text(aes(x=ymd("2020-05-20"), label="Primera ola", y=2500), colour="grey") +
+  geom_text(aes(x=ymd("2020-09-10"), label="Segunda y tercera ola", y=2500), colour="grey") +
+  labs(title = 'IA14 COVID-19 en España',x = "",
+         y = "IA14",
+         color = "Leyenda") +
+  scale_color_manual(values = colors) +
+  scale_fill_manual('',values="brown1")
+```
+
+### Conclusiones
+
+Aunque nuestro modelo no sea el más óptimo y nuestros datos cuenten con cierto sesgo, podemos ver que es capaz de captar los 'picos' (olas) de la pandemia en nuestro país. Podemos concluir que la probabilidad de que el número de casos reales de COVID-19 en España, durante la primera ole, fuese mucho mayor que el registrado es muy alta. 
+
+Por otro lado, para hacer una mejor predicción de la IA14, habría que explorar otras herramientas, tener acceso a datos más homogéneos o darle otro enfoque, como es el caso de [este artículo](https://www.datadista.com/coronavirus/estimacion-diagnostico-segunda-ola-covid19/), donde la predicción se realiza según un estudio de seroprevalencia.
+
+
+
+
+
+
+
+
+
+
+
+
